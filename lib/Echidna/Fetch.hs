@@ -1,43 +1,39 @@
-{-# LANGUAGE FlexibleContexts #-}
-
 module Echidna.Fetch where
 
-import Control.Lens
-import Control.Monad.Reader       (MonadReader)
+import Control.Monad.Catch (MonadThrow(..), throwM)
 import Control.Monad.State.Strict (execStateT)
-import Control.Monad.Catch        (MonadThrow(..), throwM)
-import Control.Monad.IO.Class     (MonadIO(..))
-import Data.Either                (fromRight)
-import Data.Has                   (Has(..))
+import Data.ByteString (ByteString, pack, append)
+import Data.ByteString.Base16 qualified as BS16 (decode)
+import Data.Either (fromRight)
+import Data.Text (Text, unlines)
+import Data.Text.Encoding (encodeUtf8)
 
 import EVM
 import EVM.Solidity
-import EVM.Types         (Addr)
+import EVM.Types (Addr)
+import EVM.Dapp (DappInfo)
 
-import Echidna.Types.Solidity     (SolConf(..), SolException(..))
-import Echidna.Types.Tx           (createTx, unlimitedGasPerBlock)
-import Echidna.Exec               (execTx)
+import Echidna.Types.Solidity (SolException(..))
+import Echidna.Types.Tx (createTx, unlimitedGasPerBlock)
+import Echidna.Exec (execTx)
+import Echidna.Events (extractEvents)
 
-import Data.ByteString (ByteString, pack, append)
-import qualified Data.ByteString.Base16 as BS16 (decode)
-import Data.Text (Text)
-import Data.Text.Encoding (encodeUtf8)
+deployContracts :: DappInfo -> [(Addr, SolcContract)] -> Addr -> VM -> IO VM
+deployContracts di cs = deployBytecodes' di $ map (\(a, c) -> (a, c.creationCode)) cs
+
+deployBytecodes :: DappInfo -> [(Addr, Text)] -> Addr -> VM -> IO VM
+deployBytecodes di cs =
+  deployBytecodes' di $ map (\(a, bc) -> (a, fromRight (error ("invalid b16 decoding of: " ++ show bc)) $ BS16.decode $ encodeUtf8 bc)) cs
 
 -- | Deploy a list of solidity contracts in certain addresses
-deployBytecodes' :: (MonadIO m, MonadThrow m, MonadReader x m, Has SolConf x)
-                       => [(Addr, ByteString)] -> Addr -> VM -> m VM
-deployBytecodes' []          _ vm = return vm
-deployBytecodes' ((a, bc):cs) d vm = deployBytecodes' cs d =<< loadRest
-  where zeros = pack $ replicate 320 0 -- This will initialize with zero a large number of possible constructor parameters
-        loadRest = do vm' <- execStateT (execTx $ createTx (bc `append` zeros) d a (fromInteger unlimitedGasPerBlock) (0, 0)) vm
-                      case vm' ^. result of
-                       (Just (VMSuccess _)) -> return vm'
-                       _                    -> throwM $ DeploymentFailed a
-
-deployContracts :: (MonadIO m, MonadThrow m, MonadReader x m, Has SolConf x)
-                       => [(Addr, SolcContract)] -> Addr -> VM -> m VM
-deployContracts cs = deployBytecodes' $ map (\(a, c) -> (a, c ^. creationCode)) cs
-
-deployBytecodes :: (MonadIO m, MonadThrow m, MonadReader x m, Has SolConf x)
-                       => [(Addr, Text)] -> Addr -> VM -> m VM
-deployBytecodes cs = deployBytecodes' $ map (\(a, bc) -> (a, fromRight (error ("invalid b16 decoding of: " ++ show bc)) $ BS16.decode $ encodeUtf8 bc)) cs
+deployBytecodes' :: DappInfo -> [(Addr, ByteString)] -> Addr -> VM -> IO VM
+deployBytecodes' _ []            _ vm = return vm
+deployBytecodes' di ((a, bc):cs) d vm =
+  deployBytecodes' di cs d =<< loadRest
+  where
+    zeros = pack $ replicate 320 0 -- This will initialize with zero a large number of possible constructor parameters
+    loadRest = do
+      vm' <- execStateT (execTx $ createTx (bc `append` zeros) d a unlimitedGasPerBlock (0, 0)) vm
+      case vm'._result of
+        (Just (VMSuccess _)) -> return vm'
+        _ -> throwM $ DeploymentFailed a (Data.Text.unlines $ extractEvents True di vm')

@@ -1,128 +1,110 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE CPP #-}
 
 module Echidna.UI where
 
+#ifdef INTERACTIVE_UI
 import Brick
 import Brick.BChan
 import Control.Concurrent (killThread, threadDelay)
-import Control.Lens
 import Control.Monad (forever, void, when)
-import Control.Monad.Catch (MonadCatch(..))
-import Control.Monad.IO.Class (MonadIO(..))
-import Control.Monad.Reader (MonadReader, runReader)
-import Control.Monad.Random.Strict (MonadRandom)
-import qualified Data.ByteString.Lazy as BS
-import Data.Has (Has(..))
-import Data.Maybe (fromMaybe)
-import Data.IORef
-import EVM (VM)
+import Control.Monad.Catch (MonadCatch(..), catchAll)
+import Graphics.Vty qualified as V
 import Graphics.Vty (Config, Event(..), Key(..), Modifier(..), defaultConfig, inputMap, mkVty)
 import System.Posix.Terminal (queryTerminal)
 import System.Posix.Types (Fd(..))
-import UnliftIO (MonadUnliftIO)
 import UnliftIO.Concurrent (forkIO, forkFinally)
+
+import Echidna.UI.Widgets
+#else /* !INTERACTIVE_UI */
+import Control.Monad (when)
+import Control.Monad.Catch (MonadCatch(..))
+import Control.Monad.State.Strict (get)
+#endif
+
+import Control.Monad.IO.Class (MonadIO(..))
+import Control.Monad.Reader (MonadReader, runReader, asks)
+import Control.Monad.Random.Strict (MonadRandom)
+import Data.ByteString.Lazy qualified as BS
+import Data.IORef
+import Data.Maybe (fromMaybe)
+import UnliftIO (MonadUnliftIO)
 import UnliftIO.Timeout (timeout)
 
-import Echidna.Campaign (campaign)
+import EVM (VM)
+
 import Echidna.ABI
-import qualified Echidna.Output.JSON
-import Echidna.Types.Solidity (SolConf(..))
+import Echidna.Campaign (campaign)
+import Echidna.Output.JSON qualified
 import Echidna.Types.Campaign
-import Echidna.Types.Test (TestConf(..), EchidnaTest)
-import Echidna.Types.Tx (Tx, TxConf)
+import Echidna.Types.Test (EchidnaTest)
+import Echidna.Types.Tx (Tx)
 import Echidna.Types.World (World)
 import Echidna.UI.Report
-import Echidna.UI.Widgets
+import Echidna.Types.Config
 
-import EVM.Dapp (DappInfo)
-
-data UIConf = UIConf { _maxTime       :: Maybe Int
-                     , _operationMode :: OperationMode
-                     }
-data OperationMode = Interactive | NonInteractive OutputFormat deriving Show
-data OutputFormat = Text | JSON | None deriving Show
-
-instance Read OutputFormat where
-  readsPrec _ = \case 't':'e':'x':'t':r -> [(Text, r)]
-                      'j':'s':'o':'n':r -> [(JSON, r)]
-                      'n':'o':'n':'e':r -> [(None, r)]
-                      _ -> []
-
-makeLenses ''UIConf
-
-data CampaignEvent = CampaignUpdated Campaign | CampaignTimedout Campaign
-
-vtyConfig :: Config
-vtyConfig = defaultConfig { inputMap = (Nothing, "\ESC[6;2~", EvKey KPageDown [MShift]) :
-                                       (Nothing, "\ESC[5;2~", EvKey KPageUp [MShift]) :
-                                       inputMap defaultConfig
-                          }
-
--- | Check if we should stop drawing (or updating) the dashboard, then do the right thing.
-monitor :: (MonadReader x m, Has CampaignConf x, Has Names x, Has TxConf x)
-        => m (App (Campaign, UIState) CampaignEvent ())
-monitor = do
-  let cs :: (CampaignConf, Names, TxConf) -> (Campaign, UIState) -> Widget ()
-      cs s c = runReader (campaignStatus c) s
-
-      se _ (AppEvent (CampaignUpdated c')) = continue (c', Running)
-      se _ (AppEvent (CampaignTimedout c')) = continue (c', Timedout)
-      se c (VtyEvent (EvKey KEsc _))                         = halt c
-      se c (VtyEvent (EvKey (KChar 'c') l)) | MCtrl `elem` l = halt c
-      se c _                                                 = continue c
-  s <- (,,) <$> view hasLens <*> view hasLens <*> view hasLens
-  pure $ App (pure . cs s) neverShowCursor se pure (const attrs)
-
--- | Heuristic check that we're in a sensible terminal (not a pipe)
-isTerminal :: MonadIO m => m Bool
-isTerminal = liftIO $ (&&) <$> queryTerminal (Fd 0) <*> queryTerminal (Fd 1)
+data CampaignEvent =
+  CampaignUpdated Campaign
+  | CampaignTimedout Campaign
+  | CampaignCrashed String
 
 -- | Set up and run an Echidna 'Campaign' and display interactive UI or
 -- print non-interactive output in desired format at the end
-ui :: ( MonadCatch m, MonadRandom m, MonadReader x m, MonadUnliftIO m
-      , Has SolConf x, Has TestConf x, Has TxConf x, Has CampaignConf x, Has Names x, Has TxConf x, Has UIConf x, Has DappInfo x)
+ui :: (MonadCatch m, MonadRandom m, MonadReader Env m, MonadUnliftIO m)
    => VM             -- ^ Initial VM state
    -> World          -- ^ Initial world state
-   -> [EchidnaTest]      -- ^ Tests to evaluate
+   -> [EchidnaTest]  -- ^ Tests to evaluate
    -> Maybe GenDict
    -> [[Tx]]
    -> m Campaign
-ui v w ts d txs = do
+ui vm world ts d txs = do
+  conf <- asks (.cfg)
+  let uiConf = conf.uiConf
   ref <- liftIO $ newIORef defaultCampaign
-  let updateRef = use hasLens >>= liftIO . atomicWriteIORef ref
+  let updateRef = get >>= liftIO . atomicWriteIORef ref
       secToUsec = (* 1000000)
-  timeoutUsec <- secToUsec . fromMaybe (-1) <$> view (hasLens . maxTime)
-  terminalPresent <- isTerminal
-  effectiveMode <- view (hasLens . operationMode) <&> \case
-    Interactive | not terminalPresent -> NonInteractive Text
-    other -> other
+      timeoutUsec = secToUsec $ fromMaybe (-1) uiConf.maxTime
+      runCampaign = timeout timeoutUsec (campaign updateRef vm world ts d txs)
+#ifdef INTERACTIVE_UI
+  terminalPresent <- liftIO isTerminal
+#endif
+  let effectiveMode = case uiConf.operationMode of
+#ifdef INTERACTIVE_UI
+        Interactive | not terminalPresent -> NonInteractive Text
+#else
+        Interactive -> NonInteractive Text
+#endif
+        other -> other
   case effectiveMode of
+#ifdef INTERACTIVE_UI
     Interactive -> do
       bc <- liftIO $ newBChan 100
       let updateUI e = readIORef ref >>= writeBChan bc . e
       ticker <- liftIO $ forkIO $ -- run UI update every 100ms
         forever $ threadDelay 100000 >> updateUI CampaignUpdated
       _ <- forkFinally -- run worker
-        (void $ timeout timeoutUsec (campaign updateRef v w ts d txs) >>= \case
-          Nothing -> liftIO $ updateUI CampaignTimedout
-          Just _ -> liftIO $ updateUI CampaignUpdated
+        (void $ do
+          catchAll
+            (runCampaign >>= \case
+              Nothing -> liftIO $ updateUI CampaignTimedout
+              Just _ -> liftIO $ updateUI CampaignUpdated)
+            (liftIO . writeBChan bc . CampaignCrashed . show)
         )
         (const $ liftIO $ killThread ticker)
-      let vty = mkVty vtyConfig
-      initialVty <- liftIO vty
-      app <- customMain initialVty vty (Just bc) <$> monitor
+      let buildVty = do
+            v <- mkVty =<< vtyConfig
+            V.setMode (V.outputIface v) V.Mouse True
+            pure v
+      initialVty <- liftIO buildVty
+      app <- customMain initialVty buildVty (Just bc) <$> monitor
       liftIO $ void $ app (defaultCampaign, Uninitialized)
       final <- liftIO $ readIORef ref
-      liftIO . putStrLn =<< ppCampaign final
+      liftIO . putStrLn $ runReader (ppCampaign final) conf
       pure final
-
+#else
+    Interactive -> error "Interactive UI is not available"
+#endif
     NonInteractive outputFormat -> do
-      result <- timeout timeoutUsec (campaign updateRef v w ts d txs)
+      result <- runCampaign
       (final, timedout) <- case result of
         Nothing -> do
           final <- liftIO $ readIORef ref
@@ -133,9 +115,58 @@ ui v w ts d txs = do
         JSON ->
           liftIO . BS.putStr $ Echidna.Output.JSON.encodeCampaign final
         Text -> do
-          liftIO . putStrLn =<< ppCampaign final
+          liftIO . putStrLn $ runReader (ppCampaign final) conf
           when timedout $ liftIO $ putStrLn "TIMEOUT!"
         None ->
           pure ()
-
       pure final
+
+#ifdef INTERACTIVE_UI
+
+vtyConfig :: IO Config
+vtyConfig = do
+  config <- V.standardIOConfig
+  pure config { inputMap = (Nothing, "\ESC[6;2~", EvKey KPageDown [MShift]) :
+                           (Nothing, "\ESC[5;2~", EvKey KPageUp [MShift]) :
+                           inputMap defaultConfig
+              }
+
+-- | Check if we should stop drawing (or updating) the dashboard, then do the right thing.
+monitor :: MonadReader Env m => m (App (Campaign, UIState) CampaignEvent Name)
+monitor = do
+  let drawUI :: EConfig -> (Campaign, UIState) -> [Widget Name]
+      drawUI conf camp = [runReader (campaignStatus camp) conf]
+
+      onEvent (AppEvent (CampaignUpdated c')) = put (c', Running)
+      onEvent (AppEvent (CampaignTimedout c')) = put (c', Timedout)
+      onEvent (AppEvent (CampaignCrashed e)) = do
+        (c,_) <- get
+        put (c, Crashed e)
+      onEvent (VtyEvent (EvKey KEsc _))                         = halt
+      onEvent (VtyEvent (EvKey (KChar 'c') l)) | MCtrl `elem` l = halt
+      onEvent (MouseDown (SBClick el n) _ _ _) =
+        case n of
+          TestsViewPort -> do
+            let vp = viewportScroll TestsViewPort
+            case el of
+              SBHandleBefore -> vScrollBy vp (-1)
+              SBHandleAfter  -> vScrollBy vp 1
+              SBTroughBefore -> vScrollBy vp (-10)
+              SBTroughAfter  -> vScrollBy vp 10
+              SBBar          -> pure ()
+          _ -> pure ()
+      onEvent _ = pure ()
+
+  conf <- asks (.cfg)
+  pure $ App { appDraw = drawUI conf
+             , appStartEvent = pure ()
+             , appHandleEvent = onEvent
+             , appAttrMap = const attrs
+             , appChooseCursor = neverShowCursor
+             }
+
+-- | Heuristic check that we're in a sensible terminal (not a pipe)
+isTerminal :: IO Bool
+isTerminal = (&&) <$> queryTerminal (Fd 0) <*> queryTerminal (Fd 1)
+
+#endif

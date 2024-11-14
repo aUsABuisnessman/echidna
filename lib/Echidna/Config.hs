@@ -1,44 +1,34 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 module Echidna.Config where
 
 import Control.Lens
-import Control.Monad.Catch (MonadThrow)
-import Control.Monad.IO.Class (MonadIO(..))
+import Control.Monad.Fail qualified as M (MonadFail(..))
 import Control.Monad.Reader (Reader, ReaderT(..), runReader)
-import Control.Monad.State (StateT(..), runStateT)
+import Control.Monad.State (StateT(..), runStateT, modify')
 import Control.Monad.Trans (lift)
-import Data.Bool (bool)
 import Data.Aeson
-import Data.Has (Has(..))
-import Data.HashMap.Strict (keys)
+import Data.Aeson.KeyMap (keys)
+import Data.Bool (bool)
+import Data.ByteString qualified as BS
 import Data.HashSet (fromList, insert, difference)
 import Data.Maybe (fromMaybe)
+import Data.Set qualified as Set
 import Data.Text (isPrefixOf)
-import EVM (result)
-import EVM.Types (w256)
+import Data.Yaml qualified as Y
 
-import qualified Control.Monad.Fail as M (MonadFail(..))
-import qualified Data.ByteString as BS
-import qualified Data.List.NonEmpty as NE
-import qualified Data.Yaml as Y
+import EVM (VM(..))
+import EVM.Types (W256)
 
 import Echidna.Test
-import Echidna.Types.Campaign 
+import Echidna.Types.Campaign
 import Echidna.Mutator.Corpus (defaultMutationConsts)
-import Echidna.Types.Config (EConfigWithUsage(..), EConfig(..))
 import Echidna.Types.Solidity
-import Echidna.Types.Tx  (TxConf(TxConf), maxGasPerBlock, defaultTimeDelay, defaultBlockDelay)
-import Echidna.Types.Test  (TestConf(..))
-import Echidna.UI
-import Echidna.UI.Report
+import Echidna.Types.Tx (TxConf(TxConf), maxGasPerBlock, defaultTimeDelay, defaultBlockDelay)
+import Echidna.Types.Test (TestConf(..))
+import Echidna.Types.Config
 
 instance FromJSON EConfig where
   -- retrieve the config from the key usage annotated parse
-  parseJSON = fmap _econfig . parseJSON
+  parseJSON x = (.econfig) <$> parseJSON @EConfigWithUsage x
 
 instance FromJSON EConfigWithUsage where
   -- this runs the parser in a StateT monad which keeps track of the keys
@@ -59,25 +49,31 @@ instance FromJSON EConfigWithUsage where
     -- x .!= v (Parser) <==> x ..!= v (StateT)
     -- tl;dr use an extra initial . to lift into the StateT parser
     where parser v =
-            let useKey k = hasLens %= insert k
+            let useKey k = modify' $ insert k
                 x ..:? k = useKey k >> lift (x .:? k)
                 x ..!= y = fromMaybe y <$> x
-                getWord s d = w256 . fromIntegral <$> v ..:? s ..!= (d :: Integer)
+                -- Parse as unbounded Integer and see if it fits into W256
+                getWord256 k def = do
+                  value :: Integer <- fromMaybe (fromIntegral (def :: W256)) <$> v ..:? k
+                  if value > fromIntegral (maxBound :: W256) then
+                    fail $ show k <> ": value does not fit in 256 bits"
+                  else
+                    pure $ fromIntegral value
 
                 -- TxConf
-                xc = TxConf <$> getWord "propMaxGas" maxGasPerBlock
-                            <*> getWord "testMaxGas" maxGasPerBlock
-                            <*> getWord "maxGasprice" 0
-                            <*> getWord "maxTimeDelay" defaultTimeDelay
-                            <*> getWord "maxBlockDelay" defaultBlockDelay
-                            <*> getWord "maxValue" 100000000000000000000 -- 100 eth
+                xc = TxConf <$> v ..:? "propMaxGas" ..!= maxGasPerBlock
+                            <*> v ..:? "testMaxGas" ..!= maxGasPerBlock
+                            <*> getWord256 "maxGasprice" 0
+                            <*> getWord256 "maxTimeDelay" defaultTimeDelay
+                            <*> getWord256 "maxBlockDelay" defaultBlockDelay
+                            <*> getWord256 "maxValue" 100000000000000000000 -- 100 eth
 
                 -- TestConf
                 tc = do
                   psender <- v ..:? "psender" ..!= 0x10000
                   fprefix <- v ..:? "prefix"  ..!= "echidna_"
                   let goal fname = if (fprefix <> "revert_") `isPrefixOf` fname then ResRevert else ResTrue
-                      classify fname vm = maybe ResOther classifyRes (vm ^. result) == goal fname
+                      classify fname vm = maybe ResOther classifyRes vm._result == goal fname
                   return $ TestConf classify (const psender)
 
                 -- CampaignConf
@@ -102,7 +98,7 @@ instance FromJSON EConfigWithUsage where
                   Nothing -> pure "property"
                 sc = SolConf <$> v ..:? "contractAddr"    ..!= defaultContractAddr
                              <*> v ..:? "deployer"        ..!= defaultDeployerAddr
-                             <*> v ..:? "sender"          ..!= (0x10000 NE.:| [0x20000, defaultDeployerAddr])
+                             <*> v ..:? "sender"          ..!= Set.fromList [0x10000, 0x20000, defaultDeployerAddr]
                              <*> v ..:? "balanceAddr"     ..!= 0xffffffff
                              <*> v ..:? "balanceContract" ..!= 0
                              <*> v ..:? "codeSize"        ..!= 0x6000      -- 24576 (EIP-170)
@@ -114,9 +110,10 @@ instance FromJSON EConfigWithUsage where
                              <*> v ..:? "initialize"      ..!= Nothing
                              <*> v ..:? "deployContracts" ..!= []
                              <*> v ..:? "deployBytecodes" ..!= []
-                             <*> v ..:? "multi-abi"       ..!= False
+                             <*> v ..:? "allContracts"    ..!= False
                              <*> mode
                              <*> v ..:? "testDestruction" ..!= False
+                             <*> v ..:? "allowFFI"        ..!= False
                              <*> fnFilter
                 names :: Names
                 names Sender = (" from: " ++) . show
@@ -135,8 +132,8 @@ defaultConfig :: EConfig
 defaultConfig = either (error "Config parser got messed up :(") id $ Y.decodeEither' ""
 
 -- | Try to parse an Echidna config file, throw an error if we can't.
-parseConfig :: (MonadThrow m, MonadIO m) => FilePath -> m EConfigWithUsage
-parseConfig f = liftIO (BS.readFile f) >>= Y.decodeThrow
+parseConfig :: FilePath -> IO EConfigWithUsage
+parseConfig f = BS.readFile f >>= Y.decodeThrow
 
 -- | Run some action with the default configuration, useful in the REPL.
 withDefaultConfig :: ReaderT EConfig m a -> m a

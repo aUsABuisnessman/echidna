@@ -3,23 +3,21 @@ name: echidna
 author: Trail of Bits <echidna-dev@trailofbits.com>
 maintainer: Trail of Bits <echidna-dev@trailofbits.com>
 
-version: 2.0.3
+version: 2.0.5
 
-ghc-options: -Wall -fno-warn-orphans -O2 -threaded +RTS -N -RTS
+# https://github.com/haskell/cabal/issues/4739
+ghc-options: -Wall -fno-warn-orphans -O2 -threaded +RTS -N -RTS -optP-Wno-nonportable-include-path
 
 dependencies:
   - base
   - aeson
-  - ansi-terminal
   - base16-bytestring
   - binary
-  - brick
-  - base16-bytestring
   - bytestring
+  - code-page
   - containers
+  - data-bword
   - data-dword
-  - data-has
-  - deepseq
   - extra
   - directory
   - exceptions
@@ -28,9 +26,7 @@ dependencies:
   - hevm
   - html-entities
   - lens
-  - lens-aeson
   - ListLike
-  - megaparsec
   - MonadRandom
   - mtl
   - optparse-applicative
@@ -38,38 +34,47 @@ dependencies:
   - random
   - rosezipper
   - semver
-  - sbv
-  - stm
   - split
-  - temporary
   - text
   - transformers
   - time
-  - unix
   - unliftio
-  - unliftio-core
   - utf8-string
   - unordered-containers
   - vector
   - vector-instances
-  - vty
-  - wl-pprint-annotated
-  - word8
+  - with-utf8
+  - word-wrap
   - yaml
 
+language: GHC2021
+
 default-extensions:
+  - LambdaCase
   - OverloadedStrings
+
+  - DuplicateRecordFields
+  - NoFieldSelectors
+  - OverloadedRecordDot
 
 library:
   source-dirs: lib/
 
+when:
+  - condition: "!os(windows)"
+    cpp-options: -DINTERACTIVE_UI
+    dependencies:
+      - brick
+      - unix
+      - vty
+
 executables:
-  echidna-test:
+  echidna:
     main: Main.hs
     source-dirs: src/
     dependencies: echidna
     when:
-        - condition: os(linux) && flag(static)
+        - condition: (os(linux) || os(windows)) && flag(static)
           ghc-options:
             - -static
             - -O2
@@ -79,6 +84,11 @@ executables:
           ghc-options:
             - -O2
           ld-options: -pthread
+        - condition: os(darwin)
+          extra-libraries: c++
+          ld-options: -Wl,-keep_dwarf_unwind
+        - condition: os(windows)
+          extra-libraries: stdc++
 
 tests:
   echidna-testsuite:
@@ -90,7 +100,7 @@ tests:
       - tasty-hunit
       - tasty-quickcheck
     when:
-        - condition: os(linux) && flag(static)
+        - condition: (os(linux) || os(windows)) && flag(static)
           ghc-options:
             - -static
             - -O2
@@ -100,9 +110,14 @@ tests:
           ghc-options:
             - -O2
           ld-options: -pthread
+        - condition: os(darwin)
+          extra-libraries: c++
+          ld-options: -Wl,-keep_dwarf_unwind
+        - condition: os(windows)
+          extra-libraries: stdc++
 
 flags:
   static:
     description: Pass -static to ghc when linking the stack binary.
     manual: true
-    default: true
+    default: false

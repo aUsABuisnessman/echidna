@@ -1,32 +1,31 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE Rank2Types #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE GADTs #-}
 
 module Echidna.Exec where
 
 import Control.Lens
-import Control.Monad.Catch (Exception, MonadThrow(..))
-import Control.Monad.State.Strict (MonadState, execState, execState)
-import Data.Has (Has(..))
+import Control.Monad.Catch (MonadThrow(..))
+import Control.Monad.State.Strict (MonadState(get, put), execState, execState, MonadIO(liftIO), runStateT)
+import Data.Map qualified as M
 import Data.Maybe (fromMaybe)
-import EVM
+import Data.Set qualified as S
+
+import EVM hiding (tx)
+import EVM.ABI
 import EVM.Exec (exec, vmForEthrunCreation)
-import EVM.Types (Buffer(..), Word)
-import EVM.Symbolic (litWord)
+import EVM.Types (Expr(ConcreteBuf, Lit), hexText)
+import Data.Text qualified as T
+import Data.Vector qualified as V
+import System.Process (readProcessWithExitCode)
 
-import qualified Data.Map as M
-import qualified Data.Set as S
-
+import Echidna.Events (emptyEvents)
 import Echidna.Transaction
+import Echidna.Types (ExecException(..), fromEVM)
 import Echidna.Types.Buffer (viewBuffer)
 import Echidna.Types.Coverage (CoverageMap)
-import Echidna.Types.Tx (TxCall(..), Tx, TxResult(..), call, dst, initialTimestamp, initialBlockNumber)
-
 import Echidna.Types.Signature (BytecodeMemo, lookupBytecodeMetadata)
-import Echidna.Events (emptyEvents)
+import Echidna.Types.Tx (TxCall(..), Tx, TxResult(..), call, dst, initialTimestamp, initialBlockNumber)
 
 -- | Broad categories of execution failures: reversions, illegal operations, and ???.
 data ErrorClass = RevertE | IllegalE | UnknownE
@@ -48,7 +47,7 @@ getQuery (VMFailure (Query q)) = Just q
 getQuery _                     = Nothing
 
 emptyAccount :: Contract
-emptyAccount = initialContract (RuntimeCode mempty)
+emptyAccount = initialContract (RuntimeCode (ConcreteRuntimeCode mempty))
 
 -- | Matches execution errors that just cause a reversion.
 pattern Reversion :: VMResult
@@ -58,113 +57,109 @@ pattern Reversion <- VMFailure (classifyError -> RevertE)
 pattern Illegal :: VMResult
 pattern Illegal <- VMFailure (classifyError -> IllegalE)
 
--- | We throw this when our execution fails due to something other than reversion.
-data ExecException = IllegalExec Error | UnknownFailure Error
-
-instance Show ExecException where
-  show (IllegalExec e) = "VM attempted an illegal operation: " ++ show e
-  show (UnknownFailure e) = "VM failed for unhandled reason, " ++ show e
-    ++ ". This shouldn't happen. Please file a ticket with this error message and steps to reproduce!"
-
-instance Exception ExecException
-
 -- | Given an execution error, throw the appropriate exception.
 vmExcept :: MonadThrow m => Error -> m ()
 vmExcept e = throwM $ case VMFailure e of {Illegal -> IllegalExec e; _ -> UnknownFailure e}
 
 -- | Given an error handler `onErr`, an execution strategy `executeTx`, and a transaction `tx`,
 -- execute that transaction using the given execution strategy, calling `onErr` on errors.
-execTxWith :: (MonadState x m, Has VM x) => (Error -> m ()) -> m VMResult -> Tx -> m (VMResult, Int)
-execTxWith onErr executeTx tx' = do
-  isSelfDestruct <- hasSelfdestructed (tx' ^. dst)
-  if isSelfDestruct then pure (VMFailure (Revert ""), 0)
+execTxWith :: (MonadIO m, MonadState s m) => Lens' s VM -> (Error -> m ()) -> m VMResult -> Tx -> m (VMResult, Int)
+execTxWith l onErr executeTx tx = do
+  vm <- use l
+  if hasSelfdestructed vm tx.dst then
+    pure (VMFailure (Revert (ConcreteBuf "")), 0)
   else do
-    hasLens . traces .= emptyEvents
-    vmBeforeTx <- use hasLens
-    setupTx tx'
-    gasLeftBeforeTx <- use $ hasLens . state . gas
-    vmResult' <- executeTx
-    gasLeftAfterTx <- use $ hasLens . state . gas
-    checkAndHandleQuery vmBeforeTx vmResult' onErr executeTx tx' gasLeftBeforeTx gasLeftAfterTx
-
-checkAndHandleQuery :: (MonadState x m, Has VM x) => VM -> VMResult -> (Error -> m ()) -> m VMResult -> Tx -> EVM.Types.Word -> EVM.Types.Word -> m (VMResult, Int)
-checkAndHandleQuery vmBeforeTx vmResult' onErr executeTx tx' gasLeftBeforeTx gasLeftAfterTx =
-        -- Continue transaction whose execution queried a contract or slot
-    let continueAfterQuery = do
-          -- Run remaining effects
-          vmResult'' <- executeTx
-          -- Correct gas usage
-          gasLeftAfterTx' <- use $ hasLens . state . gas
-          checkAndHandleQuery vmBeforeTx vmResult'' onErr executeTx tx' gasLeftBeforeTx gasLeftAfterTx'
-
-    in case getQuery vmResult' of
+    l . traces .= emptyEvents
+    vmBeforeTx <- use l
+    l %= execState (setupTx tx)
+    gasLeftBeforeTx <- use $ l . state . gas
+    vmResult <- runFully
+    gasLeftAfterTx <- use $ l . state . gas
+    handleErrorsAndConstruction vmResult vmBeforeTx
+    pure (vmResult, fromIntegral $ gasLeftBeforeTx - gasLeftAfterTx)
+  where
+  runFully = do
+    vmResult <- executeTx
+    -- For queries, we halt execution because the VM needs some additional
+    -- information from the outside. We provide this information and resume
+    -- the execution by recursively calling `runFully`.
+    case getQuery vmResult of
       -- A previously unknown contract is required
-      Just (PleaseFetchContract _ _ continuation) -> do
+      Just (PleaseFetchContract _ continuation) -> do
         -- Use the empty contract
-        hasLens %= execState (continuation emptyAccount)
-        continueAfterQuery
+        l %= execState (continuation emptyAccount)
+        runFully
 
       -- A previously unknown slot is required
       Just (PleaseFetchSlot _ _ continuation) -> do
         -- Use the zero slot
-        hasLens %= execState (continuation 0)
-        continueAfterQuery
+        l %= execState (continuation 0)
+        runFully
 
-      -- No queries to answer
-      _ -> do
-        handleErrorsAndConstruction onErr vmResult' vmBeforeTx tx'
-        return (vmResult', fromIntegral $ gasLeftBeforeTx - gasLeftAfterTx)
+      -- Execute a FFI call
+      Just (PleaseDoFFI (cmd : args) continuation) -> do
+        (_, stdout, _) <- liftIO $ readProcessWithExitCode cmd args ""
+        let encodedResponse = encodeAbiValue $
+              AbiTuple (V.fromList [AbiBytesDynamic . hexText . T.pack $ stdout])
+        l %= execState (continuation encodedResponse)
+        runFully
 
--- | Handles reverts, failures and contract creations that might be the result
--- (`vmResult`) of executing transaction `tx`.
-handleErrorsAndConstruction :: (MonadState s m, Has VM s)
-                            => (Error -> m ())
-                            -> VMResult
-                            -> VM
-                            -> Tx
-                            -> m ()
-handleErrorsAndConstruction onErr vmResult' vmBeforeTx tx' = case (vmResult', tx' ^. call) of
-  (Reversion, _) -> do
-    tracesBeforeVMReset <- use $ hasLens . traces
-    codeContractBeforeVMReset <- use $ hasLens . state . codeContract
-    calldataBeforeVMReset <- use $ hasLens . state . calldata
-    callvalueBeforeVMReset <- use $ hasLens . state . callvalue
-    -- If a transaction reverts reset VM to state before the transaction.
-    hasLens .= vmBeforeTx
-    -- Undo reset of some of the VM state.
-    -- Otherwise we'd loose all information about the reverted transaction like
-    -- contract address, calldata, result and traces.
-    hasLens . result ?= vmResult'
-    hasLens . state . calldata .= calldataBeforeVMReset
-    hasLens . state . callvalue .= callvalueBeforeVMReset 
-    hasLens . traces .= tracesBeforeVMReset
-    hasLens . state . codeContract .= codeContractBeforeVMReset
-  (VMFailure x, _) -> onErr x
-  (VMSuccess (ConcreteBuffer bytecode'), SolCreate _) ->
-    -- Handle contract creation.
-    hasLens %= execState (do
-      env . contracts . at (tx' ^. dst) . _Just . contractcode .= InitCode (ConcreteBuffer "")
-      replaceCodeOfSelf (RuntimeCode (ConcreteBuffer bytecode'))
-      loadContract (tx' ^. dst))
-  _ -> pure ()
+      -- No queries to answer, the tx is fully executed and the result is final
+      _ -> pure vmResult
+
+  -- | Handles reverts, failures and contract creations that might be the result
+  -- (`vmResult`) of executing transaction `tx`.
+  handleErrorsAndConstruction vmResult vmBeforeTx = case (vmResult, tx.call) of
+    (Reversion, _) -> do
+      tracesBeforeVMReset <- use $ l . traces
+      codeContractBeforeVMReset <- use $ l . state . codeContract
+      calldataBeforeVMReset <- use $ l . state . calldata
+      callvalueBeforeVMReset <- use $ l . state . callvalue
+      -- If a transaction reverts reset VM to state before the transaction.
+      l .= vmBeforeTx
+      -- Undo reset of some of the VM state.
+      -- Otherwise we'd loose all information about the reverted transaction like
+      -- contract address, calldata, result and traces.
+      l . result ?= vmResult
+      l . state . calldata .= calldataBeforeVMReset
+      l . state . callvalue .= callvalueBeforeVMReset
+      l . traces .= tracesBeforeVMReset
+      l . state . codeContract .= codeContractBeforeVMReset
+    (VMFailure x, _) -> onErr x
+    (VMSuccess (ConcreteBuf bytecode'), SolCreate _) ->
+      -- Handle contract creation.
+      l %= execState (do
+        env . contracts . at tx.dst . _Just . contractcode .= InitCode mempty mempty
+        replaceCodeOfSelf (RuntimeCode (ConcreteRuntimeCode bytecode'))
+        loadContract tx.dst)
+    _ -> pure ()
 
 -- | Execute a transaction "as normal".
-execTx :: (MonadState x m, Has VM x, MonadThrow m) => Tx -> m (VMResult, Int)
-execTx = execTxWith vmExcept $ liftSH exec
+execTx :: (MonadIO m, MonadState VM m, MonadThrow m) => Tx -> m (VMResult, Int)
+execTx = execTxWith id vmExcept $ fromEVM exec
 
 -- | Execute a transaction, logging coverage at every step.
-execTxWithCov :: (MonadState x m, Has VM x) => BytecodeMemo -> Lens' x CoverageMap -> m VMResult
-execTxWithCov memo l = do
-  vm :: VM          <- use hasLens
-  cm :: CoverageMap <- use l
-  let (r, vm', cm') = loop vm cm
-  hasLens .= vm'
-  l       .= cm'
-  return r
+execTxWithCov
+  :: (MonadIO m, MonadState VM m, MonadThrow m)
+  => BytecodeMemo
+  -> Tx
+  -> m ((VMResult, Int), CoverageMap)
+execTxWithCov memo tx = do
+  vm <- get
+  (r, (vm', cm)) <- runStateT (execTxWith _1 vmExcept execCov tx) (vm, mempty)
+  put vm'
+  pure (r, cm)
   where
+    -- the same as EVM.exec but collects coverage, will stop on a query
+    execCov = do
+     (vm, cm) <- get
+     let (r, vm', cm') = loop vm cm
+     put (vm', cm')
+     pure r
+
     -- | Repeatedly exec a step and add coverage until we have an end result
     loop :: VM -> CoverageMap -> (VMResult, VM, CoverageMap)
-    loop vm cm = case _result vm of
+    loop vm cm = case vm._result of
       Nothing  -> loop (stepVM vm) (addCoverage vm cm)
       Just r   -> (r, vm, cm)
 
@@ -179,15 +174,17 @@ execTxWithCov memo l = do
                        (currentMeta vm)
 
     -- | Get the VM's current execution location
-    currentCovLoc vm = (vm ^. state . pc, fromMaybe 0 $ vmOpIx vm, length $ vm ^. frames, Stop)
+    currentCovLoc vm = (vm._state._pc, fromMaybe 0 $ vmOpIx vm, length vm._frames, Stop)
 
     -- | Get the current contract's bytecode metadata
     currentMeta vm = fromMaybe (error "no contract information on coverage") $ do
-      buffer <- vm ^? env . contracts . at (vm ^. state . contract) . _Just . bytecode
+      buffer <- vm ^? env . contracts . at vm._state._contract . _Just . bytecode
       bc <- viewBuffer buffer
       pure $ lookupBytecodeMetadata memo bc
 
-initialVM :: VM
-initialVM = vmForEthrunCreation mempty & block . timestamp .~ litWord initialTimestamp
-                                       & block . number .~ initialBlockNumber
-                                       & env . contracts .~ mempty       -- fixes weird nonce issues
+initialVM :: Bool -> VM
+initialVM ffi = vmForEthrunCreation mempty
+  & block . timestamp .~ Lit initialTimestamp
+  & block . number .~ initialBlockNumber
+  & env . contracts .~ mempty       -- fixes weird nonce issues
+  & allowFFI .~ ffi

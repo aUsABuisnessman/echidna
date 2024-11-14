@@ -1,50 +1,44 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE Rank2Types #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-
 module Echidna.Output.Source where
 
-import Control.Lens
-import Data.Foldable
-import Data.Maybe (fromMaybe, mapMaybe, catMaybes)
-import Data.Text (Text, pack)
-import Data.Text.Encoding (decodeUtf8)
-import Data.Text.IO (writeFile)
-import Data.List (nub, sort)
-import Text.Printf (printf)
-import qualified HTMLEntities.Text as HTML
-
-import EVM.Solidity (SourceCache, SrcMap, SolcContract, sourceLines, sourceFiles, runtimeCode, runtimeSrcmap, creationSrcmap)
-import EVM.Debug (srcMapCodePos)
 import Prelude hiding (writeFile)
 
-import qualified Data.Vector as V
+import Data.Foldable
+import Data.Maybe (fromMaybe, mapMaybe)
+import Data.List (nub, sort)
+import Data.Map qualified as M
+import Data.Sequence qualified as Seq
+import Data.Set qualified as S
+import Data.Text (Text, pack)
+import Data.Text qualified as T
+import Data.Text.Encoding (decodeUtf8)
+import Data.Text.IO (writeFile)
+import Data.Vector qualified as V
+import HTMLEntities.Text qualified as HTML
+import Text.Printf (printf)
 
-import qualified Data.Map as M
-import qualified Data.Set as S
-import qualified Data.Text as T
+import EVM.Debug (srcMapCodePos)
+import EVM.Solidity (SourceCache(..), SrcMap, SolcContract(..))
 
 import Echidna.Types.Coverage (CoverageMap, CoverageInfo)
 import Echidna.Types.Tx (TxResult(..))
 import Echidna.Types.Signature (getBytecodeMetadata)
+import System.FilePath ((</>))
 
 type FilePathText = Text
 
-saveCoverage :: Bool -> Int -> Maybe FilePath -> SourceCache -> [SolcContract] -> CoverageMap -> IO ()
-saveCoverage isHtml seed (Just d) sc cs s = let filepath = if isHtml then ".html" else ".txt"
-                                                fn = d ++ "/covered." ++ show seed ++ filepath
-                                                cc = ppCoveredCode isHtml sc cs s
+saveCoverage :: Bool -> Int -> FilePath -> SourceCache -> [SolcContract] -> CoverageMap -> IO ()
+saveCoverage isHtml seed d sc cs s = let extension = if isHtml then ".html" else ".txt"
+                                         fn = d </> "covered." <> show seed <> extension
+                                         cc = ppCoveredCode isHtml sc cs s
                                        in writeFile fn cc
-saveCoverage _ _ Nothing  _  _  _ = pure ()
-
 
 -- | Pretty-print the covered code
 ppCoveredCode :: Bool -> SourceCache -> [SolcContract] -> CoverageMap -> Text
 ppCoveredCode isHtml sc cs s | s == mempty = "Coverage map is empty"
                              | otherwise   =
   let allFiles = zipWith (\(srcPath, _rawSource) srcLines -> (srcPath, V.map decodeUtf8 srcLines))
-                   (sc ^. sourceFiles)
-                   (sc ^. sourceLines)
+                   sc.files
+                   sc.lines
       -- ^ Collect all the possible lines from all the files
       covLines = srcMapCov sc s cs
       -- ^ List of covered lines during the fuzzing campaing
@@ -56,7 +50,12 @@ ppCoveredCode isHtml sc cs s | s == mempty = "Coverage map is empty"
         in T.unlines (changeFileName srcPath : changeFileLines (V.toList marked))
       -- ^ Pretty print individual file coverage
       topHeader
-        | isHtml = "<style> code { white-space: pre-wrap; display: block; background-color: #eee; } </style>"
+        | isHtml = "<style> code { white-space: pre-wrap; display: block; background-color: #eee; }" <>
+                   ".executed { background-color: #afa; }" <>
+                   ".reverted { background-color: #ffa; }" <>
+                   ".unexecuted { background-color: #faa; }" <>
+                   ".neutral { background-color: #eee; }" <>
+                   "</style>"
         | otherwise = ""
       -- ^ Text to add to top of the file
       changeFileName fn
@@ -80,28 +79,22 @@ markLines isHtml codeLines runtimeLines resultMap =
         markers = sort $ nub $ getMarker <$> results
         wrapLine :: Text -> Text
         wrapLine line
-          | isHtml = "<span style='background-color: #" <> color <> ";'>" <>
+          | isHtml = "<span class='" <> cssClass <> "'>" <>
                         HTML.text line <>
                      "</span>"
           | otherwise = line
           where
-          color = if n `elem` runtimeLines then getColor markers else grey
-          grey = "eee"
+          cssClass = if n `elem` runtimeLines then getCSSClass markers else "neutral"
 
     in pack $ printf " %*d | %-4s| %s" lineNrSpan n markers (wrapLine codeLine)
   lineNrSpan = length . show $ V.length codeLines + 1
 
-getColor :: String -> Text
-getColor markers =
+getCSSClass :: String -> Text
+getCSSClass markers =
   case markers of
-   []                      -> red
-   _  | '*' `elem` markers -> green
-   _                       -> yellow
-
-  where
-    green  = "afa"
-    yellow = "ffa"
-    red    = "faa"
+   []                      -> "unexecuted"
+   _  | '*' `elem` markers -> "executed"
+   _                       -> "reverted"
 
 -- | Select the proper marker, according to the result of the transaction
 getMarker :: TxResult -> Char
@@ -118,14 +111,14 @@ srcMapCov sc s contracts =
   M.map (M.fromListWith (++)) .
   M.fromListWith (++) .
   map (\(srcPath, line, txResult) -> (srcPath, [(line, [txResult])])) .
-  nub .                                               -- Deduplicate results
-  mapMaybe (srcMapCodePosResult sc) $                 -- Get the filename, number of line and tx result
+  nub .                                              -- Deduplicate results
+  mapMaybe (srcMapCodePosResult sc) $                -- Get the filename, number of line and tx result
   concatMap mapContract contracts
   where
     mapContract c =
-      mapMaybe (srcMapForOpLocation c) .                  -- Get the mapped line and tx result
-      S.toList . fromMaybe S.empty $                      -- Convert from Set to list
-      M.lookup (getBytecodeMetadata $ c ^. runtimeCode) s -- Get the coverage information of the current contract
+      mapMaybe (srcMapForOpLocation c) .             -- Get the mapped line and tx result
+      S.toList . fromMaybe S.empty $                 -- Convert from Set to list
+      M.lookup (getBytecodeMetadata c.runtimeCode) s -- Get the coverage information of the current contract
 
 -- | Given a source cache, a mapped line, return a tuple with the filename, number of line and tx result
 srcMapCodePosResult :: SourceCache -> (SrcMap, TxResult) -> Maybe (Text, Int, TxResult)
@@ -136,7 +129,7 @@ srcMapCodePosResult sc (n, r) = case srcMapCodePos sc n of
 -- | Given a contract, and tuple as coverage, return the corresponding mapped line (if any)
 srcMapForOpLocation :: SolcContract -> CoverageInfo -> Maybe (SrcMap, TxResult)
 srcMapForOpLocation contract (_,n,_,r) =
-  case preview (ix n) (contract ^. runtimeSrcmap <> contract ^. creationSrcmap) of
+  case Seq.lookup n (contract.runtimeSrcmap <> contract.creationSrcmap) of
     Just sm -> Just (sm,r)
     _       -> Nothing
 
@@ -145,7 +138,7 @@ srcMapForOpLocation contract (_,n,_,r) =
 buildRuntimeLinesMap :: SourceCache -> [SolcContract] -> M.Map Text (S.Set Int)
 buildRuntimeLinesMap sc contracts =
   M.fromListWith (<>)
-    [(k, S.singleton v) | (k, v) <- catMaybes $ srcMapCodePos sc <$> srcMaps]
+    [(k, S.singleton v) | (k, v) <- mapMaybe (srcMapCodePos sc) srcMaps]
   where
   srcMaps = concatMap
-    (\c -> toList $ c ^. runtimeSrcmap <> c ^. creationSrcmap) contracts
+    (\c -> toList $ c.runtimeSrcmap <> c.creationSrcmap) contracts

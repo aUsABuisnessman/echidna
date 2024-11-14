@@ -1,23 +1,14 @@
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE ViewPatterns #-}
-
 module Echidna.Types.Solidity where
 
-import Control.Lens
 import Control.Exception (Exception)
-import Data.Text         (Text)
-import Data.SemVer       (Version, version, toString)
+import Data.SemVer (Version, version, toString)
+import Data.Set (Set)
+import Data.Text (Text, unpack)
 
 import EVM.Solidity
-import EVM.Types         (Addr)
+import EVM.Types (Addr)
 
-import Echidna.Types.Signature    (ContractName)
-
-import qualified Data.List.NonEmpty  as NE
+import Echidna.Types.Signature (ContractName)
 
 minSupportedSolcVersion :: Version
 minSupportedSolcVersion = version 0 4 25 [] []
@@ -37,12 +28,11 @@ data SolException = BadAddr Addr
                   | NoTests
                   | OnlyTests
                   | ConstructorArgs String
-                  | DeploymentFailed Addr
-                  | SetUpCallFailed 
+                  | DeploymentFailed Addr Text
+                  | SetUpCallFailed
                   | NoCryticCompile
                   | InvalidMethodFilters Filter
                   | OutdatedSolcVersion Version
-makePrisms ''SolException
 
 instance Show SolException where
   show = \case
@@ -59,34 +49,35 @@ instance Show SolException where
     (ConstructorArgs s)      -> "Constructor arguments are required: " ++ s
     NoCryticCompile          -> "crytic-compile not installed or not found in PATH. To install it, run:\n   pip install crytic-compile"
     (InvalidMethodFilters f) -> "Applying " ++ show f ++ " to the methods produces an empty list. Are you filtering the correct functions or fuzzing the correct contract?"
-    SetUpCallFailed          -> "Calling the setUp() funciton failed (revert, out-of-gas, sending ether to an non-payable constructor, etc.)"
-    (DeploymentFailed a)     -> "Deploying the contract " ++ show a ++ " failed (revert, out-of-gas, sending ether to an non-payable constructor, etc.)"
+    SetUpCallFailed          -> "Calling the setUp() function failed (revert, out-of-gas, sending ether to an non-payable constructor, etc.)"
+    (DeploymentFailed a t)   -> "Deploying the contract " ++ show a ++ " failed (revert, out-of-gas, sending ether to an non-payable constructor, etc.):\n" ++ unpack t
     OutdatedSolcVersion v    -> "Solc version " ++ toString v ++ " detected. Echidna doesn't support versions of solc before " ++ toString minSupportedSolcVersion ++ ". Please use a newer version."
 
 
 instance Exception SolException
 
 -- | Configuration for loading Solidity for Echidna testing.
-data SolConf = SolConf { _contractAddr    :: Addr             -- ^ Contract address to use
-                       , _deployer        :: Addr             -- ^ Contract deployer address to use
-                       , _sender          :: NE.NonEmpty Addr -- ^ Sender addresses to use
-                       , _balanceAddr     :: Integer          -- ^ Initial balance of deployer and senders
-                       , _balanceContract :: Integer          -- ^ Initial balance of contract to test
-                       , _codeSize        :: Integer          -- ^ Max code size for deployed contratcs (default 24576, per EIP-170)
-                       , _prefix          :: Text             -- ^ Function name prefix used to denote tests
-                       , _cryticArgs      :: [String]         -- ^ Args to pass to crytic
-                       , _solcArgs        :: String           -- ^ Args to pass to @solc@
-                       , _solcLibs        :: [String]         -- ^ List of libraries to load, in order.
-                       , _quiet           :: Bool             -- ^ Suppress @solc@ output, errors, and warnings
-                       , _initialize      :: Maybe FilePath   -- ^ Initialize world with Etheno txns
-                       , _deployContracts :: [(Addr, String)] -- ^ List of contracts to deploy in specific addresses
-                       , _deployBytecodes :: [(Addr, Text)]   -- ^ List of contracts to deploy in specific addresses 
-                       , _multiAbi        :: Bool             -- ^ Whether or not to use the multi-abi mode
-                       , _testMode        :: String           -- ^ Testing mode
-                       , _testDestruction :: Bool             -- ^ Whether or not to add a property to detect contract destruction
-                       , _methodFilter    :: Filter           -- ^ List of methods to avoid or include calling during a campaign
-                       }
-makeLenses ''SolConf
+data SolConf = SolConf
+  { contractAddr    :: Addr             -- ^ Contract address to use
+  , deployer        :: Addr             -- ^ Contract deployer address to use
+  , sender          :: Set Addr         -- ^ Sender addresses to use
+  , balanceAddr     :: Integer          -- ^ Initial balance of deployer and senders
+  , balanceContract :: Integer          -- ^ Initial balance of contract to test
+  , codeSize        :: Integer          -- ^ Max code size for deployed contratcs (default 24576, per EIP-170)
+  , prefix          :: Text             -- ^ Function name prefix used to denote tests
+  , cryticArgs      :: [String]         -- ^ Args to pass to crytic
+  , solcArgs        :: String           -- ^ Args to pass to @solc@
+  , solcLibs        :: [String]         -- ^ List of libraries to load, in order.
+  , quiet           :: Bool             -- ^ Suppress @solc@ output, errors, and warnings
+  , initialize      :: Maybe FilePath   -- ^ Initialize world with Etheno txns
+  , deployContracts :: [(Addr, String)] -- ^ List of contracts to deploy in specific addresses
+  , deployBytecodes :: [(Addr, Text)]   -- ^ List of contracts to deploy in specific addresses
+  , allContracts    :: Bool             -- ^ Whether or not to fuzz all contracts
+  , testMode        :: String           -- ^ Testing mode
+  , testDestruction :: Bool             -- ^ Whether or not to add a property to detect contract destruction
+  , allowFFI        :: Bool             -- ^ Whether or not to allow FFI hevm cheatcode
+  , methodFilter    :: Filter           -- ^ List of methods to avoid or include calling during a campaign
+  }
 
 -- | List of contract names from every source cache
 type SourceCaches = [([ContractName], SourceCache)]
@@ -95,4 +86,4 @@ defaultContractAddr :: Addr
 defaultContractAddr = 0x00a329c0648769a73afac7f9381e08fb43dbea72
 
 defaultDeployerAddr :: Addr
-defaultDeployerAddr = 0x30000 
+defaultDeployerAddr = 0x30000

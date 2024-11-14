@@ -1,37 +1,32 @@
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE ScopedTypeVariables #-}
 
 module Echidna.Processor where
 
-import Control.Monad.IO.Class (MonadIO(..))
-import Control.Exception      (Exception)
-import Control.Monad.Catch    (MonadThrow(..))
-import Data.Aeson             ((.:), (.:?), (.!=), decode, parseJSON, withEmbeddedJSON, withObject)
-import Data.Aeson.Types       (FromJSON, Parser, Value(String))
-import Data.List              (nub, isPrefixOf)
-import Data.Maybe             (catMaybes, fromMaybe)
-import Data.Text              (pack, isSuffixOf)
-import Data.SemVer            (Version, fromText)
-import Data.Either            (fromRight)
-import Text.Read              (readMaybe)
-import System.Directory       (findExecutable)
-import System.Process         (StdStream(..), readCreateProcessWithExitCode, proc, std_err)
-import System.Exit            (ExitCode(..))
+import Control.Exception (Exception)
+import Control.Monad.Catch (MonadThrow(..))
+import Data.Aeson ((.:), (.:?), (.!=), decode, parseJSON, withEmbeddedJSON, withObject)
+import Data.Aeson.Types (FromJSON, Parser, Value(String))
+import Data.ByteString.Base16 qualified as BS16 (decode)
+import Data.ByteString.Lazy.Char8 qualified as BSL
+import Data.ByteString.UTF8 qualified as BSU
+import Data.Containers.ListUtils (nubOrd)
+import Data.Either (fromRight)
+import Data.HashMap.Strict qualified as M
+import Data.List (isPrefixOf)
+import Data.List.NonEmpty qualified as NE
+import Data.Maybe (catMaybes, fromMaybe)
+import Data.SemVer (Version, fromText)
+import Data.Text (pack, isSuffixOf)
+import System.Directory (findExecutable)
+import System.Process (StdStream(..), readCreateProcessWithExitCode, proc, std_err)
+import System.Exit (ExitCode(..))
+import Text.Read (readMaybe)
 
-import qualified Data.ByteString.Base16 as BS16 (decode)
-import qualified Data.ByteString.Lazy.Char8 as BSL
-import qualified Data.ByteString.UTF8 as BSU
-import qualified Data.List.NonEmpty as NE
-import qualified Data.HashMap.Strict as M
-
-import Echidna.Types.Signature (ContractName, FunctionName, FunctionHash)
 import EVM.ABI (AbiValue(..))
 import EVM.Types (Addr(..))
+
 import Echidna.ABI (hashSig, makeNumAbiValues, makeArrayAbiValues)
-
-
+import Echidna.Types.Signature (ContractName, FunctionName, FunctionHash)
 
 -- | Things that can go wrong trying to run a processor. Read the 'Show'
 -- instance for more detailed explanations.
@@ -56,7 +51,7 @@ filterResults Nothing rs = hashSig <$> (concat . M.elems) rs
 
 enhanceConstants :: SlitherInfo -> [AbiValue]
 enhanceConstants si =
-  nub . concatMap enh . concat . concat . M.elems $ M.elems <$> constantValues si
+  nubOrd . concatMap enh . concat . concat . M.elems $ M.elems <$> si.constantValues
   where
     enh (AbiUInt _ n) = makeNumAbiValues (fromIntegral n)
     enh (AbiInt _ n) = makeNumAbiValues (fromIntegral n)
@@ -138,12 +133,12 @@ instance FromJSON SlitherInfo where
         where failure v t = fail $ "failed to parse " ++ t ++ ": " ++ v
 
 -- Slither processing
-runSlither :: (MonadIO m, MonadThrow m) => FilePath -> [String] -> m SlitherInfo
+runSlither :: FilePath -> [String] -> IO SlitherInfo
 runSlither fp extraArgs = if ".vy" `isSuffixOf` pack fp then return noInfo else do
-  mp <- liftIO $ findExecutable "slither"
+  mp <- findExecutable "slither"
   case mp of
     Nothing -> throwM $ ProcessorNotFound "slither" "You should install it using 'pip3 install slither-analyzer --user'"
-    Just path -> liftIO $ do
+    Just path -> do
       let args = ["--ignore-compile", "--print", "echidna", "--json", "-"] ++ extraArgs ++ [fp]
       (ec, out, err) <- readCreateProcessWithExitCode (proc path args) {std_err = Inherit} ""
       case ec of
