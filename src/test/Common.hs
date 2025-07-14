@@ -99,7 +99,7 @@ runContract f selectedContract cfg workerType = do
   (_stopReason, finalState) <- flip runReaderT env $
     runWorker workerType (pure ()) vm dict 0 [] cfg.campaignConf.testLimit selectedContract
 
-  -- TODO: consider snapshotting the state so checking function don't need to
+  -- TODO: consider snapshotting the state so checking functions don't need to
   -- be IO
   pure (env, finalState)
 
@@ -140,7 +140,7 @@ testContract' fp n v configPath s workerType expectations = testCase fp $ withSo
     assertion result >>= assertBool message
 
 -- | Given a file and an optional contract name, compile the file as solidity, then, if a name is
--- given, try to fine the specified contract (assuming it is in the file provided), otherwise, find
+-- given, try to find the specified contract (assuming it is in the file provided), otherwise, find
 -- the first contract in the file. Take said contract and return an initial VM state with it loaded,
 -- its ABI (as 'SolSignature's), and the names of its Echidna tests. NOTE: unlike 'loadSpecified',
 -- contract names passed here don't need the file they occur in specified.

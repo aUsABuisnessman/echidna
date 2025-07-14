@@ -88,7 +88,7 @@ compileContracts solConf fp = do
       stderr <- if solConf.quiet
                    then UseHandle <$> openFile nullFilePath WriteMode
                    else pure Inherit
-      (ec, out, err) <- measureIO solConf.quiet ("Compiling " <> x) $ do
+      (ec, out, err) <- measureIO solConf.quiet ("Compiling `" <> x <> "`") $ do
         readCreateProcessWithExitCode
           (proc path $ (solConf.cryticArgs ++ solargs) |> x) {std_err = stderr} ""
       case ec of
@@ -98,7 +98,7 @@ compileContracts solConf fp = do
     -- | OS-specific path to the "null" file, which accepts writes without storing them
     nullFilePath :: String
     nullFilePath = if os == "mingw32" then "\\\\.\\NUL" else "/dev/null"
-  -- clean up previous artifacts
+  -- clean up previous artifact files
   removeJsonFiles "crytic-export"
   mconcat . NE.toList <$> mapM compileOne fp
 

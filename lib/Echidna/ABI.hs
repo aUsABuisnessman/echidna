@@ -165,16 +165,16 @@ mkDictValues =
 getRandomPow :: (MonadRandom m) => Int -> m Integer
 getRandomPow n = if n <= 0 then return 0 else
   do
-   -- generate uniformly a number from 20 to n
+   -- uniformly generate a number from 20 to n
    mexp <- getRandomR (20, n)
-   -- generate uniformly a number from the range 2 ^ (mexp / 2) to 2 ^ mexp  
+   -- uniformly generate a number from the range 2 ^ (mexp / 2) to 2 ^ mexp
    getRandomR (2 ^ (mexp `div` 2), 2 ^ mexp)
 
 -- Generate a random unsigned integer with the following distribution:
 -- * 9% (2/21) uniformly from 0 to 1024
 -- * 76% (16/21) uniformly from 0 to 2 ^ n - 5
 -- * 9% (2/21) uniformly from 2 ^ n - 5 to 2 ^ n - 1.
--- * 4% (1/21) using the getRandomPow function  
+-- * 4% (1/21) using the getRandomPow function
 getRandomUint :: MonadRandom m => Int -> m Integer
 getRandomUint n =
   join $ Random.weighted
@@ -191,7 +191,7 @@ getRandomInt :: MonadRandom m => Int -> m Integer
 getRandomInt n =
   getRandomR =<< Random.weighted
     [ ((-1023, 1023), 1)
-    , ((-1 * 2 ^ (n - 1), 2 ^ (n - 1) - 1), 9)
+    , (((-1) * 2 ^ (n - 1), 2 ^ (n - 1) - 1), 9)
     ]
 
 -- | Synthesize a random 'AbiValue' given its 'AbiType'. Doesn't use a dictionary.
@@ -218,7 +218,7 @@ fixAbiInt n x =
      else AbiInt n (x `mod` (2 ^ (n - 1) - 1))
 
 -- | Given a way to generate random 'Word8's and a 'ByteString' b of length l,
--- generate between 0 and 2l 'Word8's and add insert them into b at random indices.
+-- generate between 0 and 2l 'Word8's and insert them into b at random indices.
 addChars :: MonadRandom m => m Word8 -> ByteString -> m ByteString
 addChars c b = foldM withR b . enumFromTo 0 =<< rand where
   rand       = getRandomR (0, BS.length b - 1)

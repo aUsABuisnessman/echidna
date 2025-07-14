@@ -41,11 +41,11 @@ enhanceConstants si =
     enh (AbiString s) = makeArrayAbiValues s
     enh v = [v]
 
-data AssertLocation = AssertLocation 
+data AssertLocation = AssertLocation
   { start :: Int
   , filenameRelative :: String
   , filenameAbsolute :: String
-  , assertLines :: [Int]
+  , assertLines :: NE.NonEmpty Int
   , startColumn :: Int
   , endingColumn :: Int
   } deriving (Show)
@@ -77,13 +77,13 @@ instance FromJSON AssertLocation where
     filenameAbsolute <- o.: "filename_absolute"
     assertLines <- o.: "lines"
     startColumn <- o.: "starting_column"
-    endingColumn <- o.: "ending_column" 
+    endingColumn <- o.: "ending_column"
     pure AssertLocation {..}
 
 instance FromJSON ContractAssertListing where
   parseJSON x = (AssertFunctionList <$> parseJSON x) <|> (AssertLocationList <$> parseJSON x)
 
--- we loose info on what constants are in which functions
+-- we lose info on what constants are in which functions
 data SlitherInfo = SlitherInfo
   { payableFunctions :: Map ContractName [FunctionName]
   , constantFunctions :: Map ContractName [FunctionName]
@@ -115,7 +115,7 @@ instance FromJSON SlitherInfo where
           :: Map ContractName (Map FunctionName [[Maybe AbiValue]])
           <- o .: "constants_used" >>= (traverse . traverse . traverse . traverse) parseConstant
         -- flatten [[AbiValue]], the array probably shouldn't be nested, fix it in Slither
-        let constantValues = (fmap . fmap) (catMaybes . concat) constantValues'
+        let constantValues = (fmap . fmap) (concatMap catMaybes) constantValues'
         functionsRelations <- o .: "functions_relations"
         generationGraph <-
           (traverse . traverse) (withObject "relations" (.: "impacts")) functionsRelations
@@ -161,7 +161,7 @@ runSlither fp solConf = if solConf.disableSlither
     Just path -> do
       let args = ["--ignore-compile", "--print", "echidna", "--json", "-"]
                  ++ solConf.cryticArgs ++ [fp]
-      (exitCode, out, err) <- measureIO solConf.quiet ("Running slither on " <> fp) $
+      (exitCode, out, err) <- measureIO solConf.quiet ("Running slither on `" <> fp <> "`") $
         readCreateProcessWithExitCode (proc path args) {std_err = Inherit} ""
       case exitCode of
         ExitSuccess ->
