@@ -17,7 +17,6 @@ import EVM.Dapp (DappInfo)
 
 import Echidna.ABI (ppAbiValue, GenDict(..))
 import Echidna.Events (Events, extractEvents)
-import Echidna.Types (Gas)
 import Echidna.Types.Campaign (WorkerState(..))
 import Echidna.Types.Config (Env(..))
 import Echidna.Types.Coverage (CoverageInfo, mergeCoverageMaps)
@@ -31,7 +30,6 @@ data Campaign = Campaign
   , _tests :: [Test]
   , seed :: Int
   , coverage :: Map String [CoverageInfo]
-  , gasInfo :: [(Text, (Gas, [Tx]))]
   }
 
 instance ToJSON Campaign where
@@ -41,7 +39,6 @@ instance ToJSON Campaign where
     , "tests" .= _tests
     , "seed" .= seed
     , "coverage" .= coverage
-    , "gas_info" .= gasInfo
     ]
 
 data Test = Test
@@ -71,10 +68,11 @@ instance ToJSON TestType where
   toJSON Property = "property"
   toJSON Assertion = "assertion"
 
-data TestStatus = Fuzzing | Shrinking | Solved | Passed | Error
+data TestStatus = Fuzzing | Shrinking | Solved | Verified | Passed | Error
 
 instance ToJSON TestStatus where
   toJSON Fuzzing = "fuzzing"
+  toJSON Verified = "verified"
   toJSON Shrinking = "shrinking"
   toJSON Solved = "solved"
   toJSON Passed = "passed"
@@ -112,7 +110,6 @@ encodeCampaign env workerStates = do
     , _tests = mapTest env.dapp <$> tests
     , seed = seed
     , coverage = Map.mapKeys (("0x" ++) . (`showHex` "")) $ VU.toList <$> frozenCov
-    , gasInfo = Map.toList $ Map.unionsWith max ((.gasInfo) <$> workerStates)
     }
 
 mapTest :: DappInfo -> EchidnaTest -> Test
@@ -131,6 +128,7 @@ mapTest dappInfo test =
   mapTestState T.Open _ = (Fuzzing, Nothing, Nothing)
   mapTestState T.Passed _ = (Passed, Nothing, Nothing)
   mapTestState T.Solved txs = (Solved, Just $ mapTx <$> txs, Nothing)
+  mapTestState T.Unsolvable _ = (Verified, Nothing, Nothing)
   mapTestState (T.Large _) txs = (Shrinking, Just $ mapTx <$> txs, Nothing)
   mapTestState (T.Failed e) _ = (Error, Nothing, Just $ show e) -- TODO add (show e)
 

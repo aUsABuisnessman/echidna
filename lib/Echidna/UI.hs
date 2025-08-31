@@ -43,15 +43,23 @@ import Echidna.Types.Corpus qualified as Corpus
 import Echidna.Types.Coverage (coverageStats)
 import Echidna.Types.Test (EchidnaTest(..), didFail, isOptimizationTest)
 import Echidna.Types.Tx (Tx)
+import Echidna.Types.Worker 
 import Echidna.UI.Report
 import Echidna.UI.Widgets
 import Echidna.Utility (timePrefix, getTimestamp)
+import Echidna.Worker (getNWorkers, workerIDToType)
 
 data UIEvent =
   CampaignUpdated LocalTime [EchidnaTest] [WorkerState]
   | FetchCacheUpdated (Map Addr (Maybe Contract))
                       (Map Addr (Map W256 (Maybe W256)))
   | EventReceived (LocalTime, CampaignEvent)
+
+-- | Gas tracking state for calculating gas consumption rate
+data GasTracker = GasTracker
+  { lastUpdateTime :: LocalTime
+  , totalGasConsumed :: Int
+  }
 
 -- | Set up and run an Echidna 'Campaign' and display interactive UI or
 -- print non-interactive output in desired format at the end
@@ -157,7 +165,7 @@ ui vm dict initialCorpus cliSelectedContract = do
       liftIO $ killThread ticker
 
       states <- workerStates workers
-      liftIO . putStrLn =<< ppCampaign vm states
+      liftIO . putStrLn =<< ppCampaign states
 
       pure states
 
@@ -174,10 +182,14 @@ ui vm dict initialCorpus cliSelectedContract = do
       let forwardEvent ev = putStrLn =<< runReaderT (ppLogLine vm ev) env
       uiEventsForwarderStopVar <- spawnListener forwardEvent
 
+      -- Track last update time and gas for delta calculation
+      startTime <- liftIO getTimestamp
+      lastUpdateRef <- liftIO $ newIORef $ GasTracker startTime 0
+
       let printStatus = do
             states <- liftIO $ workerStates workers
             time <- timePrefix <$> getTimestamp
-            line <- statusLine env states
+            line <- statusLine env states lastUpdateRef
             putStrLn $ time <> "[status] " <> line
             hFlush stdout
 
@@ -208,7 +220,7 @@ ui vm dict initialCorpus cliSelectedContract = do
         JSON ->
           liftIO $ BS.putStr =<< Echidna.Output.JSON.encodeCampaign env states
         Text -> do
-          liftIO . putStrLn =<< ppCampaign vm states
+          liftIO . putStrLn =<< ppCampaign  states
         None ->
           pure ()
       pure states
@@ -379,15 +391,27 @@ isTerminal = hNowSupportsANSI stdout
 statusLine
   :: Env
   -> [WorkerState]
+  -> IORef GasTracker  -- Gas consumption tracking state
   -> IO String
-statusLine env states = do
+statusLine env states lastUpdateRef = do
   tests <- traverse readIORef env.testRefs
   (points, _) <- coverageStats env.coverageRefInit env.coverageRefRuntime
   corpus <- readIORef env.corpusRef
+  now <- getTimestamp
   let totalCalls = sum ((.ncalls) <$> states)
+  let totalGas = sum ((.totalGas) <$> states)
+
+  -- Calculate delta-based gas/s
+  gasTracker <- readIORef lastUpdateRef
+  let deltaTime = round $ diffLocalTime now gasTracker.lastUpdateTime
+  let deltaGas = totalGas - gasTracker.totalGasConsumed
+  let gasPerSecond = if deltaTime > 0 then deltaGas `div` deltaTime else 0
+  writeIORef lastUpdateRef $ GasTracker now totalGas
+
   pure $ "tests: " <> show (length $ filter didFail tests) <> "/" <> show (length tests)
     <> ", fuzzing: " <> show totalCalls <> "/" <> show env.cfg.campaignConf.testLimit
     <> ", values: " <> show ((.value) <$> filter isOptimizationTest tests)
     <> ", cov: " <> show points
     <> ", corpus: " <> show (Corpus.corpusSize corpus)
+    <> ", gas/s: " <> show gasPerSecond
 

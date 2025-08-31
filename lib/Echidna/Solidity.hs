@@ -39,7 +39,6 @@ import Echidna.ABI
   ( encodeSig, encodeSigWithName, hashSig, fallback
   , commonTypeSizes, mkValidAbiInt, mkValidAbiUInt )
 import Echidna.Deploy (deployContracts, deployBytecodes)
-import Echidna.Etheno (loadEthenoBatch)
 import Echidna.Events (extractEvents)
 import Echidna.Exec (execTx, execTxWithCov, initialVM)
 import Echidna.SourceAnalysis.Slither
@@ -174,17 +173,16 @@ loadSpecified
 loadSpecified env mainContract cs = do
   let solConf = env.cfg.solConf
 
-  -- Set up initial VM, either with chosen contract or Etheno initialization file
+  -- Set up initial VM with chosen contract
   -- need to use snd to add to ABI dict
   initVM <- stToIO $ initialVM solConf.allowFFI
   let vm = initVM & #block % #gaslimit .~ unlimitedGasPerBlock
                   & #block % #maxCodeSize .~ fromIntegral solConf.codeSize
 
-  blank' <- maybe (pure vm) (loadEthenoBatch solConf.allowFFI) solConf.initialize
   let blank = populateAddresses (Set.insert solConf.deployer solConf.sender)
-                                solConf.balanceAddr blank'
+                                solConf.balanceAddr vm
 
-  unless (null mainContract.constructorInputs || isJust solConf.initialize) $
+  unless (null mainContract.constructorInputs) $
     throwM $ ConstructorArgs (show mainContract.constructorInputs)
 
   -- Select libraries
@@ -349,6 +347,7 @@ mkWorld SolConf{sender, testMode} sigMap maybeContract slitherInfo contracts =
   let
     eventMap = Map.unions $ map (.eventMap) contracts
     payableSigs = filterResults maybeContract slitherInfo.payableFunctions
+    assertSigs = filterResults maybeContract (assertFunctionList <$> slitherInfo.asserts)
     as = if isAssertionMode testMode then filterResults maybeContract (assertFunctionList <$> slitherInfo.asserts) else []
     cs = if isDapptestMode testMode then [] else filterResults maybeContract slitherInfo.constantFunctions \\ as
     (highSignatureMap, lowSignatureMap) = prepareHashMaps cs as $
@@ -357,6 +356,7 @@ mkWorld SolConf{sender, testMode} sigMap maybeContract slitherInfo contracts =
            , highSignatureMap
            , lowSignatureMap
            , payableSigs
+           , assertSigs
            , eventMap
            }
 
