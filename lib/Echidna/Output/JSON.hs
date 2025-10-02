@@ -83,8 +83,9 @@ data Transaction = Transaction
   { contract :: Text
   , function :: Text
   , arguments :: Maybe [String]
-  , gas :: Integer
-  , gasprice :: Integer
+  , gas :: String
+  , gasprice :: String
+  , value :: String
   }
 
 instance ToJSON Transaction where
@@ -94,6 +95,7 @@ instance ToJSON Transaction where
     , "arguments" .= arguments
     , "gas" .= gas
     , "gasprice" .= gasprice
+    , "value" .= value
     ]
 
 encodeCampaign :: Env -> [WorkerState] -> IO L.ByteString
@@ -130,7 +132,7 @@ mapTest dappInfo test =
   mapTestState T.Solved txs = (Solved, Just $ mapTx <$> txs, Nothing)
   mapTestState T.Unsolvable _ = (Verified, Nothing, Nothing)
   mapTestState (T.Large _) txs = (Shrinking, Just $ mapTx <$> txs, Nothing)
-  mapTestState (T.Failed e) _ = (Error, Nothing, Just $ show e) -- TODO add (show e)
+  mapTestState (T.Failed e) _ = (Error, Nothing, Just $ Prelude.show e) -- TODO add (show e)
 
   mapTx tx =
     let (function, args) = mapCall tx.call
@@ -138,12 +140,13 @@ mapTest dappInfo test =
       { contract = "" -- TODO add when mapping is available https://github.com/crytic/echidna/issues/415
       , function = function
       , arguments = args
-      , gas = toInteger tx.gas
-      , gasprice = toInteger tx.gasprice
+      , gas = show tx.gas
+      , gasprice = show tx.gasprice
+      , value = show tx.value
       }
 
   mapCall = \case
     SolCreate _          -> ("<CREATE>", Nothing)
-    SolCall (name, args) -> (name, Just $ ppAbiValue <$> mempty <*> args)
+    SolCall (name, args) -> (name, Just $ ppAbiValue mempty <$> args)
     NoCall               -> ("*wait*", Nothing)
     SolCalldata x        -> (decodeUtf8 $ "0x" <> BS16.encode x, Nothing)
