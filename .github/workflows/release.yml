@@ -24,23 +24,27 @@ jobs:
           - os: ubuntu-latest
             name: Linux (x86_64)
             tuple: x86_64-linux
+            system: x86_64-linux
             timeout: 180
           - os: ubuntu-24.04-arm
             name: Linux (aarch64)
             tuple: aarch64-linux
+            system: aarch64-linux
             timeout: 180
-          - os: macos-15-intel
+          - os: macos-14
             name: macOS (x86_64)
             tuple: x86_64-macos
+            system: x86_64-darwin
           - os: macos-14
             name: macOS (aarch64)
             tuple: aarch64-macos
+            system: aarch64-darwin
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v20
+        uses: DeterminateSystems/nix-installer-action@v21
 
       - name: Configure Cachix
         uses: cachix/cachix-action@v16
@@ -66,11 +70,13 @@ jobs:
 
       - name: Build redistributable echidna
         run: |
-          nix build .#echidna-redistributable --out-link redistributable
+          nix build ".#packages.${NIX_SYSTEM}.echidna-redistributable" --out-link redistributable
           tar -czf "echidna-${{ steps.version.outputs.version }}-${{ matrix.tuple }}.tar.gz" -C ./redistributable/bin/ echidna
+        env:
+          NIX_SYSTEM: ${{ matrix.system }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: echidna-redistributable-${{ matrix.tuple }}
           path: echidna-${{ steps.version.outputs.version }}-${{ matrix.tuple }}.tar.gz
@@ -86,21 +92,21 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Download binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           pattern: echidna-redistributable-*
           merge-multiple: true
 
       - name: Sign binaries
-        uses: sigstore/gh-action-sigstore-python@v3.0.1
+        uses: sigstore/gh-action-sigstore-python@v3.2.0
         with:
           inputs: ./echidna-*.tar.gz
 
       - name: Create GitHub release and upload binaries
-        uses: softprops/action-gh-release@v2.3.3
+        uses: softprops/action-gh-release@v2.5.0
         with:
           draft: true
           name: "Echidna ${{ needs.nixBuild.outputs.version }}"

@@ -13,8 +13,8 @@ import Data.Set qualified as Set
 import Data.Text (isPrefixOf)
 import Data.Yaml qualified as Y
 
-import EVM.Types (VM(..), W256)
 import EVM.Solvers (Solver(..))
+import EVM.Types (VM(..), W256)
 
 import Echidna.Mutator.Corpus (defaultMutationConsts)
 import Echidna.Test
@@ -55,6 +55,7 @@ instance FromJSON EConfigWithUsage where
               <*> testConfParser
               <*> txConfParser
               <*> (UIConf <$> v ..:? "timeout" <*> formatParser)
+              <*> v ..:? "allEvents" ..!= False
               <*> v ..:? "rpcUrl"
               <*> v ..:? "rpcBlock"
               <*> v ..:? "etherscanApiKey"

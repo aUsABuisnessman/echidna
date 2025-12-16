@@ -128,10 +128,10 @@ jobs:
           MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Cache Local
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.local
@@ -143,7 +143,7 @@ jobs:
           printf "\nflags:\n  hevm:\n    static-secp256k1: true\n  echidna:\n    static: true\n" >> stack.yaml
 
       - name: Cache Stack & Cabal
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .stack-work
@@ -188,7 +188,7 @@ jobs:
         run: GZIP=-9 tar -czf echidna.tar.gz -C $APPDATA/local/bin/ echidna.exe
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: echidna-${{ runner.os }}
           path: echidna.tar.gz
@@ -202,7 +202,7 @@ jobs:
 
       - name: Upload testsuite
         if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: echidna-testsuite-${{ runner.os }}
           path: echidna-testsuite*
@@ -231,7 +231,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -249,14 +249,17 @@ jobs:
           HOST_OS: ${{ runner.os }}
           SOLC_VER: ${{ matrix.solc }}
 
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
       - name: Download testsuite
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
          name: echidna-testsuite-${{ runner.os }}
 
       - name: Test
         run: |
-          export PATH="$PATH:$HOME/.local/bin"
+          export PATH="$PATH:$HOME/.local/bin:$HOME/.foundry/bin"
           solc-select use ${{ matrix.solc }}
           chmod +x echidna-testsuite*
           ./echidna-testsuite*

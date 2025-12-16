@@ -1,33 +1,31 @@
 module Echidna.SymExec.Common where
 
 import Control.Monad.IO.Unlift (MonadUnliftIO, liftIO)
+import Control.Monad.State.Strict (execState, runStateT)
 import Data.Function ((&))
 import Data.Map qualified as Map
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text qualified as T
-import GHC.IORef (IORef, readIORef)
 import Optics.Core ((.~), (%), (%~))
-import EVM.ABI (abiKind, AbiKind(Dynamic), Sig(..), decodeBuf, AbiVals(..))
-import EVM.Fetch qualified as Fetch
+
 import EVM (loadContract, resetState, symbolify)
+import EVM.ABI (abiKind, AbiKind(Dynamic), Sig(..), decodeBuf, AbiVals(..))
 import EVM.Effects (TTY, ReadConfig)
+import EVM.Expr qualified
+import EVM.Fetch qualified as Fetch
+import EVM.Format (formatPartialDetailed)
 import EVM.Solidity (SolcContract(..), SourceCache(..), Method(..), WarningData(..))
 import EVM.Solvers (SolverGroup)
-import EVM.SymExec (mkCalldata, verifyInputs, VeriOpts(..), checkAssertions, subModel, defaultSymbolicValues)
-import EVM.Expr qualified
-import EVM.Types (Addr, VMType(..), EType(..), Expr(..), Block(..), W256, SMTCex(..), ProofResult(..), Prop(..), Query(..), forceLit)
+import EVM.SymExec (mkCalldata, verifyInputsWithHandler, VeriOpts(..), checkAssertions, subModel, defaultSymbolicValues)
+import EVM.Types (Addr, VMType(..), EType(..), Expr(..), Block(..), W256, SMTCex(..), ProofResult(..), Prop(..), forceLit, isQed)
 import qualified EVM.Types (VM(..))
-import EVM.Format (formatPartialDetailed)
-import Control.Monad.ST (RealWorld)
-import Control.Monad.State.Strict (execState, runStateT)
 
 import Echidna.Types (fromEVM)
 import Echidna.Types.Config (EConfig(..))
 import Echidna.Types.Solidity (SolConf(..))
 import Echidna.Types.Tx (Tx(..), TxCall(..), TxConf(..), maxGasPerBlock)
-import Echidna.Types.Cache (ContractCache, SlotCache)
 
 type PartialsLogs = [T.Text]
 
@@ -45,8 +43,8 @@ extractErrors = mapMaybe (\case
   _ -> Nothing)
 
 suitableForSymExec :: Method -> Bool
-suitableForSymExec m = not $ null m.inputs 
-  && null (filter (\(_, t) -> abiKind t == Dynamic) m.inputs) 
+suitableForSymExec m = not $ null m.inputs
+  && null (filter (\(_, t) -> abiKind t == Dynamic) m.inputs)
   && not (T.isInfixOf "_no_symexec" m.name)
 
 
@@ -79,7 +77,7 @@ modelToTx dst oldTimestamp oldNumber method senders fallbackSender calldata resu
           Left e -> Left e
         args = case argdata of
           Right argdata' -> case decodeBuf types argdata' of
-            CAbi v -> v
+            (CAbi v, _) -> v
             _ -> []
           Left _ -> []
 
@@ -108,24 +106,6 @@ modelToTx dst oldTimestamp oldNumber method senders fallbackSender calldata resu
     Unknown err -> SMTErrorFromResult err
     r -> error ("Unexpected value in `modelToTx`: " ++ show r)
 
-
-cachedOracle :: IORef ContractCache -> IORef SlotCache -> SolverGroup -> Fetch.RpcInfo -> Fetch.Fetcher t m s
-cachedOracle contractCacheRef slotCacheRef solvers info q = do
-  case q of
-    PleaseFetchContract addr _ continue -> do
-      cache <- liftIO $ readIORef contractCacheRef
-      case Map.lookup addr cache of
-          Just (Just contract) -> pure $ continue contract
-          _                    -> oracle q
-    PleaseFetchSlot addr slot continue -> do
-      cache <- liftIO $ readIORef slotCacheRef
-      case Map.lookup addr cache >>= Map.lookup slot of
-        Just (Just value) -> pure $ continue value
-        _                 -> oracle q
-    _ -> oracle q
-
-  where oracle = Fetch.oracle solvers info
-
 rpcFetcher :: Functor f =>
   f a -> Maybe W256 -> f (Fetch.BlockNumber, a)
 
@@ -145,14 +125,13 @@ getUnknownLogs = mapMaybe (\case
   _ -> Nothing)
 
 exploreMethod :: (MonadUnliftIO m, ReadConfig m, TTY m) =>
-  Method -> SolcContract -> SourceCache -> EVM.Types.VM Concrete RealWorld -> Addr -> EConfig -> VeriOpts -> SolverGroup -> Fetch.RpcInfo -> IORef ContractCache -> IORef SlotCache -> m ([TxOrError], PartialsLogs)
-  
-exploreMethod method contract sources vm defaultSender conf veriOpts solvers rpcInfo contractCacheRef slotCacheRef = do
+  Method -> SolcContract -> SourceCache -> EVM.Types.VM Concrete -> Addr -> EConfig -> VeriOpts -> SolverGroup -> Fetch.RpcInfo -> Fetch.Session -> m ([TxOrError], PartialsLogs)
+
+exploreMethod method contract sources vm defaultSender conf veriOpts solvers rpcInfo session = do
   calldataSym@(_, constraints) <- mkCalldata (Just (Sig method.methodSignature (snd <$> method.inputs))) []
   let
     cd = fst calldataSym
-  let
-    fetcher = cachedOracle contractCacheRef slotCacheRef solvers rpcInfo
+    fetcher = Fetch.oracle solvers (Just session) rpcInfo
     dst = conf.solConf.contractAddr
   vmReset <- liftIO $ snd <$> runStateT (fromEVM resetState) vm
   let
@@ -169,8 +148,8 @@ exploreMethod method contract sources vm defaultSender conf veriOpts solvers rpc
 
   -- TODO we might want to switch vm's state.baseState value to to AbstractBase eventually.
   -- Doing so might mess up concolic execution.
-  (_, models, partials) <- verifyInputs solvers veriOpts fetcher vm'' (Just $ checkAssertions [0x1])
-  let results = map fst models
-  let warnData = Just $ WarningData contract sources vm' 
+  (models, partials) <- verifyInputsWithHandler solvers veriOpts fetcher vm'' (checkAssertions [0x1]) Nothing
+  let results = filter (\(r, _) -> not (isQed r)) models & map fst
+  let warnData = Just $ WarningData contract sources vm'
   --liftIO $ mapM_ TIO.putStrLn partials
   return (map (modelToTx dst vm.block.timestamp vm.block.number method conf.solConf.sender defaultSender cd) results, map (formatPartialDetailed warnData . fst) partials)

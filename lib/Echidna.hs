@@ -2,7 +2,7 @@ module Echidna where
 
 import Control.Concurrent (newChan)
 import Control.Monad.Catch (MonadThrow(..))
-import Control.Monad.ST (RealWorld)
+import Control.Monad.IO.Class (liftIO)
 import Data.IORef (newIORef)
 import Data.List (find, nub)
 import Data.List.NonEmpty (NonEmpty)
@@ -10,29 +10,33 @@ import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Set qualified as Set
+import Data.Text qualified as T
 import System.FilePath ((</>))
+import System.IO (stderr, hPutStrLn)
 
 import EVM (cheatCode)
 import EVM.ABI (AbiValue(AbiAddress))
 import EVM.Dapp (dappInfo)
+import EVM.Effects (TTY(..), ReadConfig(..), defaultConfig)
+import EVM.Fetch qualified
 import EVM.Solidity (BuildOutput(..), Contracts(Contracts), Method(..), Mutability(..), SolcContract(..))
 import EVM.Types hiding (Env)
 
 import Echidna.ABI
 import Echidna.Onchain as Onchain
 import Echidna.Output.Corpus
-import Echidna.SourceMapping (findSrcForReal)
-import Echidna.SourceAnalysis.Slither
 import Echidna.Solidity
+import Echidna.SourceAnalysis.Slither
+import Echidna.SourceMapping (findSrcForReal)
 import Echidna.SymExec.Symbolic (forceAddr)
 import Echidna.Types.Campaign
 import Echidna.Types.Config
 import Echidna.Types.Random
+import Echidna.Types.Signature (ContractName)
 import Echidna.Types.Solidity
+import Echidna.Types.Test (EchidnaTest)
 import Echidna.Types.Tx
 import Echidna.Types.World
-import Echidna.Types.Test (EchidnaTest)
-import Echidna.Types.Signature (ContractName)
 
 -- | This function is used to prepare, process, compile and initialize smart contracts for testing.
 -- It takes:
@@ -51,7 +55,7 @@ prepareContract
   -> BuildOutput
   -> Maybe ContractName
   -> Seed
-  -> IO (VM Concrete RealWorld, Env, GenDict)
+  -> IO (VM Concrete, Env, GenDict)
 prepareContract cfg solFiles buildOutput selectedContract seed = do
   let solConf = cfg.solConf
       (Contracts contractMap) = buildOutput.contracts
@@ -107,6 +111,13 @@ loadInitialCorpus env = do
       ctxs2 <- loadTxs (dir </> "coverage")
       pure (ctxs1 ++ ctxs2)
 
+instance TTY IO where
+  writeOutput = liftIO . putStrLn . T.unpack
+  writeErr = liftIO . hPutStrLn stderr . T.unpack
+
+instance ReadConfig IO where
+  readConfig = pure defaultConfig
+
 mkEnv :: EConfig -> BuildOutput -> [EchidnaTest] -> World -> Maybe SlitherInfo -> IO Env
 mkEnv cfg buildOutput tests world slitherInfo = do
   codehashMap <- newIORef mempty
@@ -116,13 +127,11 @@ mkEnv cfg buildOutput tests world slitherInfo = do
   coverageRefRuntime <- newIORef mempty
   corpusRef <- newIORef mempty
   testRefs <- traverse newIORef tests
-  (contractCache, slotCache) <- Onchain.loadRpcCache cfg
-  fetchContractCache <- newIORef contractCache
-  fetchSlotCache <- newIORef slotCache
+  fetchSession <- EVM.Fetch.mkSession cfg.campaignConf.corpusDir (fromIntegral <$> cfg.rpcBlock)
   contractNameCache <- newIORef mempty
   -- TODO put in real path
   let dapp = dappInfo "/" buildOutput
-  pure $ Env { cfg, dapp, codehashMap, fetchContractCache, fetchSlotCache, contractNameCache
+  pure $ Env { cfg, dapp, codehashMap, fetchSession, contractNameCache
              , chainId, eventQueue, coverageRefInit, coverageRefRuntime, corpusRef, testRefs, world
              , slitherInfo
              }
