@@ -1,9 +1,9 @@
 name: echidna
 
-author: Trail of Bits <echidna-dev@trailofbits.com>
-maintainer: Trail of Bits <echidna-dev@trailofbits.com>
+author: Trail of Bits <opensource@trailofbits.com>
+maintainer: Trail of Bits <opensource@trailofbits.com>
 
-version: 2.3.0
+version: 2.3.1
 
 ghc-options:
   - -O2
